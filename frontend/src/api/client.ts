@@ -53,6 +53,13 @@ export interface StatusResponse {
   }
 }
 
+export interface TonightViewlineResponse {
+  viewline: ViewlinePoint[]
+  max_kp: number
+  window_start: string
+  window_end: string
+}
+
 export interface Alert {
   timestamp: string
   alert_type: string
@@ -101,6 +108,15 @@ export const api = {
   async getStatus(): Promise<StatusResponse> {
     const { data } = await client.get('/api/status')
     return data
+  },
+
+  async getTonightViewline(): Promise<TonightViewlineResponse | null> {
+    try {
+      const { data } = await client.get('/api/aurora/viewline/tonight')
+      return data
+    } catch {
+      return null
+    }
   },
 
   async getAlerts(): Promise<Alert[]> {

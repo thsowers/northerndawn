@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::config::AppConfig;
 use crate::db::Database;
-use crate::models::{KpForecast, KpIndex, OvationResponse, SolarWind, ViewlinePoint};
+use crate::models::{KpForecast, KpIndex, OvationResponse, SolarWind, TonightViewlineResponse, ViewlinePoint};
 use crate::notifications::NotificationManager;
 
 /// Shared application state accessible from API handlers and polling tasks.
@@ -18,6 +18,7 @@ pub struct AppState {
 pub struct Cache {
     pub ovation: RwLock<Option<OvationResponse>>,
     pub viewline: RwLock<Vec<ViewlinePoint>>,
+    pub tonight_viewline: RwLock<Option<TonightViewlineResponse>>,
     pub kp_current: RwLock<Vec<KpIndex>>,
     pub kp_forecast: RwLock<Vec<KpForecast>>,
     pub solar_wind: RwLock<Vec<SolarWind>>,
@@ -32,6 +33,7 @@ impl Cache {
         Self {
             ovation: RwLock::new(None),
             viewline: RwLock::new(Vec::new()),
+            tonight_viewline: RwLock::new(None),
             kp_current: RwLock::new(Vec::new()),
             kp_forecast: RwLock::new(Vec::new()),
             solar_wind: RwLock::new(Vec::new()),

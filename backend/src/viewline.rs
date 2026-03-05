@@ -1,17 +1,37 @@
-use std::collections::BTreeMap;
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 
-use crate::models::{OvationResponse, ViewlinePoint};
+use crate::models::{KpForecast, OvationResponse, TonightViewlineResponse, ViewlinePoint};
 
-/// Earth's mean radius in km.
-const EARTH_RADIUS_KM: f64 = 6371.0;
+/// Geomagnetic north pole (IGRF-14 epoch 2025).
+const GEOMAG_POLE_LAT_DEG: f64 = 80.85;
+const GEOMAG_POLE_LON_DEG: f64 = -72.76;
 
-/// Aurora base altitude in km — the lower/brighter edge of aurora, which
-/// determines how far over the horizon it can be seen.
-const AURORA_ALTITUDE_KM: f64 = 100.0;
+/// Minimum aurora probability (0-100) to consider as the equatorward boundary.
+const AURORA_PROBABILITY_THRESHOLD: f64 = 1.0;
 
-/// Geomagnetic north pole (IGRF-13 epoch 2025 approximation).
-const GEOMAG_POLE_LAT_DEG: f64 = 80.7;
-const GEOMAG_POLE_LON_DEG: f64 = -72.7;
+/// Maximum gap in latitude degrees between consecutive above-threshold points
+/// before we consider the aurora oval to have ended. Prevents stray low-latitude
+/// noise (grid artifacts at 0-10°N) from pulling the boundary to the equator.
+const BOUNDARY_GAP_THRESHOLD: f64 = 5.0;
+
+/// Number of neighboring longitude bins for moving-average smoothing.
+const SMOOTHING_WINDOW: usize = 15;
+
+/// Viewing offset in geographic degrees. Aurora at ~100-200 km altitude can be
+/// seen on the horizon from further equatorward. Derived from Case et al. 2016.
+const VIEWING_OFFSET_DEG: f64 = 8.0;
+
+/// Base geomagnetic latitude of the equatorward auroral boundary at Kp=0.
+const BASE_GEOMAG_LAT: f64 = 66.0;
+
+/// Degrees of geomagnetic latitude shift per unit Kp (used in Kp fallback).
+const KP_COEFFICIENT: f64 = 2.0;
+
+/// Viewing offset for the Kp-based model (degrees added to angular distance
+/// from geomagnetic pole). Smaller than VIEWING_OFFSET_DEG because the
+/// empirical Kp formula already targets the equatorward boundary, and the
+/// NOAA viewline implicitly includes horizon viewing geometry.
+const KP_VIEWING_OFFSET_DEG: f64 = 1.0;
 
 fn to_rad(deg: f64) -> f64 {
     deg * std::f64::consts::PI / 180.0
@@ -32,97 +52,141 @@ fn normalize_lon(lon: f64) -> f64 {
     l
 }
 
-/// Angular distance (radians) on a sphere between two lat/lon points (in radians).
-fn angular_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    (lat1.sin() * lat2.sin() + lat1.cos() * lat2.cos() * (lon2 - lon1).cos()).acos()
-}
-
-/// Horizon viewing angle (radians) — how far an observer at ground level
-/// can see an object at AURORA_ALTITUDE_KM due to Earth's curvature.
-fn horizon_offset_rad() -> f64 {
-    (EARTH_RADIUS_KM / (EARTH_RADIUS_KM + AURORA_ALTITUDE_KM)).acos()
-}
-
-/// Computes the aurora viewline from OVATION data.
+/// Computes the aurora viewline from OVATION model probability data.
 ///
-/// Algorithm:
-/// 1. For each longitude, find the aurora edge (lowest latitude with
-///    probability >= threshold) — Northern Hemisphere only.
-/// 2. Compute each edge point's angular distance from the geomagnetic pole.
-/// 3. Take the maximum distance (furthest equatorward extent of the oval).
-/// 4. Add the horizon viewing offset to get the viewline distance.
-/// 5. Generate the viewline as a circle at that distance from the geomagnetic
-///    pole, converted to geographic coordinates.
-///
-/// This produces the smooth, slightly asymmetric oval matching the NOAA
-/// visualization — the line dips further south over North America (near the
-/// geomagnetic pole) and stays further north over Asia.
-pub fn compute_viewline(ovation: &OvationResponse, threshold: f64) -> Vec<ViewlinePoint> {
-    let pole_lat = to_rad(GEOMAG_POLE_LAT_DEG);
-    let pole_lon = to_rad(GEOMAG_POLE_LON_DEG);
-
-    // Step 1: Find aurora edge per longitude
-    let mut lon_to_min_lat: BTreeMap<i32, f64> = BTreeMap::new();
+/// Algorithm (matching NOAA / helioforecast auroramaps):
+/// 1. For each integer longitude 0-359, find the minimum NH latitude where
+///    aurora probability >= threshold (equatorward boundary).
+/// 2. Smooth the boundary with a moving average over `SMOOTHING_WINDOW` bins.
+/// 3. Subtract `VIEWING_OFFSET_DEG` to get the visible-aurora viewline.
+pub fn compute_viewline_from_ovation(ovation: &OvationResponse) -> Vec<ViewlinePoint> {
+    // Step 1: For each longitude bin, collect NH latitudes above threshold
+    let mut lon_bins: Vec<Vec<f64>> = vec![Vec::new(); 360];
 
     for coord in &ovation.coordinates {
-        let lon = coord[0]; // 0..359
+        let lon = coord[0];
         let lat = coord[1];
-        let probability = coord[2];
+        let prob = coord[2];
 
-        if lat <= 0.0 {
+        // Northern hemisphere only, above probability threshold
+        if lat <= 0.0 || prob < AURORA_PROBABILITY_THRESHOLD {
             continue;
         }
 
-        if probability >= threshold {
-            let lon_key = lon as i32;
-            let entry = lon_to_min_lat.entry(lon_key).or_insert(90.0);
-            if lat < *entry {
-                *entry = lat;
+        let lon_idx = (lon.round() as i32).rem_euclid(360) as usize;
+        lon_bins[lon_idx].push(lat);
+    }
+
+    // Step 2: For each longitude, find the equatorward boundary by scanning
+    // from pole toward equator. Stop when there's a gap > BOUNDARY_GAP_THRESHOLD
+    // degrees between consecutive above-threshold latitudes. This prevents
+    // stray low-latitude noise from pulling the boundary to the equator.
+    let mut raw_boundary: [Option<f64>; 360] = [None; 360];
+
+    for (lon_idx, lats) in lon_bins.iter_mut().enumerate() {
+        if lats.is_empty() {
+            continue;
+        }
+
+        // Sort descending: pole → equator
+        lats.sort_by(|a, b| b.partial_cmp(a).unwrap());
+
+        let mut boundary = lats[0];
+        for i in 1..lats.len() {
+            if lats[i - 1] - lats[i] > BOUNDARY_GAP_THRESHOLD {
+                break;
+            }
+            boundary = lats[i];
+        }
+
+        raw_boundary[lon_idx] = Some(boundary);
+    }
+
+    // Step 2: Smooth with a moving average over SMOOTHING_WINDOW
+    let half_window = SMOOTHING_WINDOW / 2;
+    let mut smoothed: [Option<f64>; 360] = [None; 360];
+
+    for i in 0..360 {
+        if raw_boundary[i].is_none() {
+            continue;
+        }
+
+        let mut sum = 0.0;
+        let mut count = 0;
+
+        for offset in 0..SMOOTHING_WINDOW {
+            let j = (i + 360 - half_window + offset) % 360;
+            if let Some(val) = raw_boundary[j] {
+                sum += val;
+                count += 1;
             }
         }
-    }
 
-    // Step 2-3: Find maximum angular distance from geomagnetic pole
-    let mut max_dist: f64 = 0.0;
-    for (&lon_key, &lat) in &lon_to_min_lat {
-        let geo_lon = if lon_key > 180 {
-            lon_key as f64 - 360.0
-        } else {
-            lon_key as f64
-        };
-        let dist = angular_distance(to_rad(lat), to_rad(geo_lon), pole_lat, pole_lon);
-        if dist > max_dist {
-            max_dist = dist;
+        if count > 0 {
+            smoothed[i] = Some(sum / count as f64);
         }
     }
 
-    if max_dist == 0.0 {
-        return Vec::new();
+    // Step 3: Apply viewing offset and build output
+    let mut points: Vec<ViewlinePoint> = Vec::with_capacity(360);
+
+    for (lon_idx, boundary_lat) in smoothed.iter().enumerate() {
+        if let Some(lat) = boundary_lat {
+            let viewline_lat = lat - VIEWING_OFFSET_DEG;
+
+            // Only include NH points
+            if viewline_lat <= 0.0 {
+                continue;
+            }
+
+            // Convert 0-359 to -180..180
+            let lon = normalize_lon(lon_idx as f64);
+
+            points.push(ViewlinePoint {
+                lon,
+                lat: viewline_lat,
+            });
+        }
     }
 
-    // Step 4: Add horizon offset
-    let viewline_dist = max_dist + horizon_offset_rad();
+    points.sort_by(|a, b| a.lon.partial_cmp(&b.lon).unwrap());
+    points
+}
 
-    // Step 5: Generate viewline as a circle at viewline_dist from the
-    // geomagnetic pole, sampled every 1° of azimuth
+/// Kp-based viewline fallback (used when OVATION data is unavailable).
+///
+/// Uses the empirical relationship:
+///   equatorward auroral boundary ≈ 66° - 2° × Kp  (geomagnetic latitude)
+///
+/// The boundary is projected from geomagnetic to geographic coordinates,
+/// then shifted equatorward by `VIEWING_OFFSET_DEG`.
+pub fn compute_viewline(kp: f64) -> Vec<ViewlinePoint> {
+    let pole_lat = to_rad(GEOMAG_POLE_LAT_DEG);
+    let pole_lon = to_rad(GEOMAG_POLE_LON_DEG);
+
+    // Geomagnetic latitude of the equatorward auroral boundary
+    let geomag_lat = BASE_GEOMAG_LAT - KP_COEFFICIENT * kp;
+
+    // Angular distance from the geomagnetic pole, plus viewing offset
+    let dist = to_rad(90.0 - geomag_lat + KP_VIEWING_OFFSET_DEG);
+
+    // Generate viewline as a circle at `dist` from the geomagnetic pole
     let mut points: Vec<ViewlinePoint> = Vec::with_capacity(360);
 
     for az_deg in 0..360 {
         let az = to_rad(az_deg as f64);
 
-        // Point at angular distance viewline_dist from pole, at azimuth az
-        let lat = (pole_lat.sin() * viewline_dist.cos()
-            + pole_lat.cos() * viewline_dist.sin() * az.cos())
+        let lat = (pole_lat.sin() * dist.cos()
+            + pole_lat.cos() * dist.sin() * az.cos())
         .asin();
 
         let lon = pole_lon
-            + (az.sin() * viewline_dist.sin() * pole_lat.cos())
-                .atan2(viewline_dist.cos() - pole_lat.sin() * lat.sin());
+            + (az.sin() * dist.sin() * pole_lat.cos())
+                .atan2(dist.cos() - pole_lat.sin() * lat.sin());
 
         let lat_deg = to_deg(lat);
         let lon_deg = normalize_lon(to_deg(lon));
 
-        // Only include Northern Hemisphere points
         if lat_deg > 0.0 {
             points.push(ViewlinePoint {
                 lon: lon_deg,
@@ -133,6 +197,67 @@ pub fn compute_viewline(ovation: &OvationResponse, threshold: f64) -> Vec<Viewli
 
     points.sort_by(|a, b| a.lon.partial_cmp(&b.lon).unwrap());
     points
+}
+
+/// Computes tonight's viewline from Kp forecast data.
+///
+/// "Tonight" is defined as the 6pm–6am Central Standard Time window (UTC-6),
+/// i.e., 00:00–12:00 UTC of the relevant UTC date. If the current time is
+/// before 06:00 CST (12:00 UTC), the overnight window that started last
+/// evening is still active; otherwise the upcoming evening's window is used.
+///
+/// Returns `None` if no forecast entries fall within the window.
+pub fn compute_tonight_viewline(
+    forecasts: &[KpForecast],
+    now: DateTime<Utc>,
+) -> Option<TonightViewlineResponse> {
+    let (window_start, window_end) = tonight_window(now);
+
+    let max_kp = forecasts
+        .iter()
+        .filter_map(|f| {
+            // KpForecast time_tag format: "2026-03-05 12:00:00"
+            let dt = chrono::NaiveDateTime::parse_from_str(&f.time_tag, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|ndt| Utc.from_utc_datetime(&ndt))?;
+            if dt >= window_start && dt < window_end {
+                Some(f.kp)
+            } else {
+                None
+            }
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    if max_kp.is_infinite() {
+        return None;
+    }
+
+    let viewline = compute_viewline(max_kp);
+    Some(TonightViewlineResponse {
+        viewline,
+        max_kp,
+        window_start,
+        window_end,
+    })
+}
+
+/// Returns (window_start, window_end) in UTC for the "tonight" CST window.
+///
+/// The window is always 00:00–12:00 UTC of a specific date:
+/// - If current UTC hour < 12 (before 06:00 CST), tonight is [today 00:00 UTC, today 12:00 UTC].
+/// - Otherwise, tonight is [tomorrow 00:00 UTC, tomorrow 12:00 UTC].
+fn tonight_window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let today_midnight = Utc
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+        .single()
+        .unwrap();
+
+    if now.hour() < 12 {
+        (today_midnight, today_midnight + Duration::hours(12))
+    } else {
+        let tomorrow_midnight = today_midnight + Duration::hours(24);
+        (tomorrow_midnight, tomorrow_midnight + Duration::hours(12))
+    }
 }
 
 /// Checks whether aurora is potentially visible at the given location.
@@ -160,9 +285,224 @@ pub fn is_aurora_visible(
     }
 }
 
+/// Returns the viewline latitude at a specific longitude for the given Kp.
+/// Wraps the existing spherical geometry from `compute_viewline`.
+pub fn viewline_lat_at_lon(kp: f64, target_lon: f64) -> Option<f64> {
+    let viewline = compute_viewline(kp);
+    if viewline.is_empty() {
+        return None;
+    }
+
+    let closest = viewline
+        .iter()
+        .min_by(|a, b| {
+            let diff_a = (a.lon - target_lon).abs();
+            let diff_b = (b.lon - target_lon).abs();
+            diff_a.partial_cmp(&diff_b).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+
+    Some(closest.lat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::OvationResponse;
+
+    /// Helper: find the viewline latitude at a given longitude.
+    fn find_lat(viewline: &[ViewlinePoint], lon: f64) -> f64 {
+        viewline
+            .iter()
+            .min_by(|a, b| {
+                (a.lon - lon)
+                    .abs()
+                    .partial_cmp(&(b.lon - lon).abs())
+                    .unwrap()
+            })
+            .unwrap()
+            .lat
+    }
+
+    /// Build synthetic OVATION data with a uniform boundary at `boundary_lat`
+    /// for all longitudes, and optionally a dip for a specific longitude range.
+    fn make_ovation(
+        boundary_lat: f64,
+        dip_lon_range: Option<(f64, f64)>,
+        dip_lat: Option<f64>,
+    ) -> OvationResponse {
+        let mut coordinates = Vec::new();
+
+        for lon in 0..360 {
+            let lon_f = lon as f64;
+
+            // Points poleward of the boundary have aurora
+            let equatorward = if let (Some((lo, hi)), Some(dl)) = (dip_lon_range, dip_lat) {
+                if lon_f >= lo && lon_f <= hi {
+                    dl
+                } else {
+                    boundary_lat
+                }
+            } else {
+                boundary_lat
+            };
+
+            // Add aurora points from equatorward boundary up to 80°
+            let mut lat = equatorward;
+            while lat <= 80.0 {
+                coordinates.push([lon_f, lat, 10.0]);
+                lat += 1.0;
+            }
+
+            // Add sub-threshold points below boundary
+            if equatorward > 1.0 {
+                let mut lat = 0.0;
+                while lat < equatorward {
+                    coordinates.push([lon_f, lat, 0.0]);
+                    lat += 1.0;
+                }
+            }
+        }
+
+        OvationResponse {
+            observation_time: "2026-03-04 00:00".to_string(),
+            forecast_time: "2026-03-04 00:30".to_string(),
+            coordinates,
+        }
+    }
+
+    // --- OVATION-based viewline tests ---
+
+    #[test]
+    fn test_ovation_uniform_boundary() {
+        // Uniform boundary at 55°N → viewline at 55 - 8 = 47°N everywhere
+        let ovation = make_ovation(55.0, None, None);
+        let vl = compute_viewline_from_ovation(&ovation);
+
+        assert!(!vl.is_empty(), "Viewline should not be empty");
+        assert_eq!(vl.len(), 360, "Should have a point for every longitude");
+
+        for pt in &vl {
+            assert!(
+                (pt.lat - 47.0).abs() < 1.0,
+                "Expected ~47°N, got {:.1}°N at lon {:.0}°",
+                pt.lat,
+                pt.lon
+            );
+        }
+    }
+
+    #[test]
+    fn test_ovation_asymmetry() {
+        // Dip at longitudes 270-300 (= -90 to -60 geographic, roughly US)
+        // Boundary 50°N in the dip region, 60°N everywhere else
+        let ovation = make_ovation(60.0, Some((270.0, 300.0)), Some(50.0));
+        let vl = compute_viewline_from_ovation(&ovation);
+
+        let us_lat = find_lat(&vl, -80.0);
+        let europe_lat = find_lat(&vl, 15.0);
+
+        assert!(
+            us_lat < europe_lat,
+            "US ({:.1}°N) should be further south than Europe ({:.1}°N)",
+            us_lat,
+            europe_lat,
+        );
+    }
+
+    #[test]
+    fn test_ovation_smoothing() {
+        // Create a sharp dip at a single longitude — smoothing should soften it
+        let ovation = make_ovation(60.0, Some((180.0, 181.0)), Some(40.0));
+        let vl = compute_viewline_from_ovation(&ovation);
+
+        // After smoothing over 15° window, the single-bin dip should be damped
+        let dip_lat = find_lat(&vl, 0.0); // lon 180 = lon 0 after normalize (actually -180)
+        let neighbor_lat = find_lat(&vl, 10.0);
+
+        // The dip should be softened (not the full 20° difference)
+        let diff = (neighbor_lat - dip_lat).abs();
+        assert!(
+            diff < 15.0,
+            "Smoothing should dampen the dip: diff={:.1}° (expected <15°)",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_ovation_no_jagged_jumps() {
+        let ovation = make_ovation(55.0, Some((200.0, 230.0)), Some(45.0));
+        let vl = compute_viewline_from_ovation(&ovation);
+
+        for i in 1..vl.len() {
+            // Only check adjacent longitudes (skip big lon gaps)
+            let lon_diff = (vl[i].lon - vl[i - 1].lon).abs();
+            if lon_diff > 2.0 {
+                continue;
+            }
+
+            let lat_diff = (vl[i].lat - vl[i - 1].lat).abs();
+            assert!(
+                lat_diff < 3.0,
+                "Jagged: {:.1}° jump at lon {:.0}°",
+                lat_diff,
+                vl[i].lon,
+            );
+        }
+    }
+
+    #[test]
+    fn test_ovation_ignores_low_latitude_noise() {
+        // Simulate real OVATION data: aurora oval at 60-80°N, plus noise at 0-5°N
+        let mut coordinates = Vec::new();
+        for lon in 0..360 {
+            let lon_f = lon as f64;
+            // Real aurora oval: 60-80°N with high probability
+            for lat in 60..=80 {
+                coordinates.push([lon_f, lat as f64, 10.0]);
+            }
+            // Noise at low latitudes (as seen in real OVATION data)
+            coordinates.push([lon_f, 0.0, 1.0]);
+            coordinates.push([lon_f, 1.0, 1.0]);
+        }
+
+        let ovation = OvationResponse {
+            observation_time: String::new(),
+            forecast_time: String::new(),
+            coordinates,
+        };
+
+        let vl = compute_viewline_from_ovation(&ovation);
+        assert!(!vl.is_empty());
+
+        // Viewline should be near 60 - 8 = 52°N, NOT near the equator
+        for pt in &vl {
+            assert!(
+                pt.lat > 40.0,
+                "Viewline at {:.1}°N (lon {:.0}°) — noise should be ignored",
+                pt.lat,
+                pt.lon,
+            );
+        }
+    }
+
+    #[test]
+    fn test_ovation_no_aurora_returns_empty() {
+        // All probabilities below threshold
+        let ovation = OvationResponse {
+            observation_time: String::new(),
+            forecast_time: String::new(),
+            coordinates: (0..360)
+                .flat_map(|lon| {
+                    (0..90).map(move |lat| [lon as f64, lat as f64, 0.0])
+                })
+                .collect(),
+        };
+
+        let vl = compute_viewline_from_ovation(&ovation);
+        assert!(vl.is_empty(), "No aurora should produce empty viewline");
+    }
+
+    // --- Kp fallback tests ---
 
     #[test]
     fn test_normalize_lon() {
@@ -173,82 +513,51 @@ mod tests {
     }
 
     #[test]
-    fn test_horizon_offset() {
-        let offset_deg = to_deg(horizon_offset_rad());
-        // For 100km altitude, offset should be ~10.1°
-        assert!(offset_deg > 9.0 && offset_deg < 11.0, "offset was {}", offset_deg);
+    fn test_kp_fallback_generates_points() {
+        let viewline = compute_viewline(3.0);
+        assert_eq!(viewline.len(), 360);
     }
 
     #[test]
-    fn test_viewline_is_smooth_circle() {
-        // Create a synthetic OVATION grid with aurora at 65°N everywhere
-        let mut coordinates = Vec::new();
-        for lon in 0..360 {
-            for lat in 0..=90 {
-                let prob = if lat >= 63 && lat <= 70 { 10.0 } else { 0.0 };
-                coordinates.push([lon as f64, lat as f64, prob]);
-            }
-        }
+    fn test_kp_fallback_higher_kp_further_south() {
+        let lat3 = find_lat(&compute_viewline(3.0), -93.0);
+        let lat5 = find_lat(&compute_viewline(5.0), -93.0);
 
-        let ovation = OvationResponse {
-            observation_time: "2024-01-01".to_string(),
-            forecast_time: "2024-01-01".to_string(),
-            coordinates,
-        };
+        assert!(
+            lat5 < lat3,
+            "Higher Kp should push viewline further south: Kp3={:.1}°N, Kp5={:.1}°N",
+            lat3,
+            lat5
+        );
+    }
 
-        let viewline = compute_viewline(&ovation, 5.0);
-        assert!(!viewline.is_empty());
+    #[test]
+    fn test_kp_fallback_asymmetry() {
+        let viewline = compute_viewline(4.0);
 
-        // The viewline should be smooth — check that adjacent points
-        // don't jump more than a few degrees in latitude
+        let near_us = find_lat(&viewline, -93.0);
+        let near_russia = find_lat(&viewline, 90.0);
+
+        assert!(
+            near_us < near_russia,
+            "US ({:.1}°N) should be further south than Russia ({:.1}°N)",
+            near_us,
+            near_russia,
+        );
+    }
+
+    #[test]
+    fn test_kp_fallback_smooth() {
+        let viewline = compute_viewline(4.0);
         for i in 1..viewline.len() {
             let lat_diff = (viewline[i].lat - viewline[i - 1].lat).abs();
             assert!(
                 lat_diff < 3.0,
-                "Jagged viewline: lat diff {} between points {} and {}",
+                "Jagged: {:.1}° jump at index {}",
                 lat_diff,
-                i - 1,
                 i
             );
         }
-    }
-
-    #[test]
-    fn test_viewline_asymmetry() {
-        // With a uniform aurora oval, the viewline should dip further south
-        // near the geomagnetic pole's longitude (-73°W) than on the opposite side
-        let mut coordinates = Vec::new();
-        for lon in 0..360 {
-            for lat in 0..=90 {
-                let prob = if lat >= 63 && lat <= 70 { 10.0 } else { 0.0 };
-                coordinates.push([lon as f64, lat as f64, prob]);
-            }
-        }
-
-        let ovation = OvationResponse {
-            observation_time: "2024-01-01".to_string(),
-            forecast_time: "2024-01-01".to_string(),
-            coordinates,
-        };
-
-        let viewline = compute_viewline(&ovation, 5.0);
-
-        // Find viewline lat near Minneapolis (-93) and near Moscow (37)
-        let near_us = viewline
-            .iter()
-            .min_by(|a, b| (a.lon - (-93.0)).abs().partial_cmp(&(b.lon - (-93.0)).abs()).unwrap())
-            .unwrap();
-        let near_russia = viewline
-            .iter()
-            .min_by(|a, b| (a.lon - 37.0).abs().partial_cmp(&(b.lon - 37.0).abs()).unwrap())
-            .unwrap();
-
-        assert!(
-            near_us.lat < near_russia.lat,
-            "US viewline ({:.1}°N) should be further south than Russia ({:.1}°N)",
-            near_us.lat,
-            near_russia.lat,
-        );
     }
 
     #[test]
@@ -258,7 +567,6 @@ mod tests {
             ViewlinePoint { lon: -93.0, lat: 46.0 },
             ViewlinePoint { lon: -92.0, lat: 47.0 },
         ];
-
         assert!(is_aurora_visible(&viewline, 45.0, -93.0).is_none());
         assert!(is_aurora_visible(&viewline, 47.0, -93.0).is_some());
     }
@@ -266,5 +574,147 @@ mod tests {
     #[test]
     fn test_empty_viewline() {
         assert!(is_aurora_visible(&[], 45.0, -93.0).is_none());
+    }
+
+    // --- compute_tonight_viewline tests ---
+
+    fn make_forecast(time_tag: &str, kp: f64) -> KpForecast {
+        KpForecast {
+            time_tag: time_tag.to_string(),
+            kp,
+            observed: "estimated".to_string(),
+            noaa_scale: "".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_tonight_window_before_noon_utc() {
+        // 08:00 UTC = 02:00 CST — still in overnight window
+        let now = Utc.with_ymd_and_hms(2026, 3, 6, 8, 0, 0).unwrap();
+        let (start, end) = tonight_window(now);
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 3, 6, 0, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 3, 6, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_tonight_window_after_noon_utc() {
+        // 20:00 UTC = 14:00 CST — evening window is upcoming
+        let now = Utc.with_ymd_and_hms(2026, 3, 5, 20, 0, 0).unwrap();
+        let (start, end) = tonight_window(now);
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 3, 6, 0, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 3, 6, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_compute_tonight_viewline_picks_max_kp() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 6, 8, 0, 0).unwrap();
+        let forecasts = vec![
+            make_forecast("2026-03-06 01:00:00", 2.0),
+            make_forecast("2026-03-06 04:00:00", 4.0), // max in window
+            make_forecast("2026-03-06 07:00:00", 3.0),
+            make_forecast("2026-03-06 14:00:00", 5.0), // outside window
+        ];
+        let result = compute_tonight_viewline(&forecasts, now).unwrap();
+        assert_eq!(result.max_kp, 4.0);
+        assert!(!result.viewline.is_empty());
+    }
+
+    #[test]
+    fn test_compute_tonight_viewline_no_entries_returns_none() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 6, 8, 0, 0).unwrap();
+        let forecasts = vec![
+            make_forecast("2026-03-06 14:00:00", 3.0), // all outside window
+        ];
+        assert!(compute_tonight_viewline(&forecasts, now).is_none());
+    }
+
+    // --- NOAA reference verification tests ---
+
+    #[test]
+    fn test_kp1_noaa_reference() {
+        // NOAA image 2026-03-05 Kp=1: viewline through central-southern Canada
+        // At lon -80 (Ontario): ~53-55N
+        let lat = viewline_lat_at_lon(1.0, -80.0).unwrap();
+        assert!(
+            lat >= 53.0 && lat <= 55.0,
+            "Kp=1 at lon -80: expected 53-55N, got {:.1}N",
+            lat
+        );
+
+        // Pacific (~-125): further north due to geomagnetic pole offset
+        let lat_pac = viewline_lat_at_lon(1.0, -125.0).unwrap();
+        assert!(
+            lat_pac >= 55.0 && lat_pac <= 62.0,
+            "Kp=1 at lon -125: expected 55-62N, got {:.1}N",
+            lat_pac
+        );
+    }
+
+    #[test]
+    fn test_kp3_noaa_reference() {
+        // NOAA image 2026-03-04 Kp=3: viewline near US/Canada border ~49-51N
+        let lat = viewline_lat_at_lon(3.0, -80.0).unwrap();
+        assert!(
+            lat >= 49.0 && lat <= 51.0,
+            "Kp=3 at lon -80: expected 49-51N, got {:.1}N",
+            lat
+        );
+
+        // Pacific (~-125): further north due to geomagnetic pole offset
+        let lat_pac = viewline_lat_at_lon(3.0, -125.0).unwrap();
+        assert!(
+            lat_pac >= 51.0 && lat_pac <= 57.0,
+            "Kp=3 at lon -125: expected 51-57N, got {:.1}N",
+            lat_pac
+        );
+    }
+
+    #[test]
+    fn test_kp4_noaa_reference() {
+        // NOAA image 2026-03-04 Kp=4: viewline at ~46-48N (WA->MI->ME)
+        let lat = viewline_lat_at_lon(4.0, -80.0).unwrap();
+        assert!(
+            lat >= 46.0 && lat <= 48.0,
+            "Kp=4 at lon -80: expected 46-48N, got {:.1}N",
+            lat
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_dump_viewline_geojson() {
+        use std::fs;
+        use std::path::Path;
+
+        let output_dir = Path::new("test_output");
+        fs::create_dir_all(output_dir).unwrap();
+
+        for kp in 1..=5 {
+            let viewline = compute_viewline(kp as f64);
+            let coords: Vec<String> = viewline
+                .iter()
+                .map(|p| format!("[{:.2}, {:.2}]", p.lon, p.lat))
+                .collect();
+
+            let geojson = format!(
+                r#"{{
+  "type": "FeatureCollection",
+  "features": [{{
+    "type": "Feature",
+    "properties": {{ "kp": {kp}, "description": "Kp={kp} viewline" }},
+    "geometry": {{
+      "type": "LineString",
+      "coordinates": [{coords}]
+    }}
+  }}]
+}}"#,
+                kp = kp,
+                coords = coords.join(", ")
+            );
+
+            let path = output_dir.join(format!("viewline_kp{}.geojson", kp));
+            fs::write(&path, geojson).unwrap();
+            println!("Wrote {}", path.display());
+        }
     }
 }

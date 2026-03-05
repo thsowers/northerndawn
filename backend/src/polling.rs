@@ -29,62 +29,75 @@ fn spawn_ovation_poll(state: Arc<AppState>, noaa: Arc<NoaaClient>) {
 
             match noaa.fetch_ovation().await {
                 Ok(ovation) => {
-                    let threshold = state.config.thresholds.aurora_probability_min;
-                    let vl = viewline::compute_viewline(&ovation, threshold);
+                    // Compute viewline from OVATION data
+                    let mut vl = viewline::compute_viewline_from_ovation(&ovation);
 
-                    info!(viewline_points = vl.len(), "Viewline computed");
+                    // Fall back to Kp-based viewline if OVATION yields no boundary
+                    if vl.is_empty() {
+                        let kp_data = state.cache.kp_current.read().unwrap();
+                        if let Some(latest) = kp_data.last() {
+                            let kp = latest.kp_index;
+                            vl = viewline::compute_viewline(kp);
+                            info!(kp = kp, "OVATION boundary empty, using Kp fallback");
+                        }
+                    } else {
+                        info!(viewline_points = vl.len(), "Viewline computed from OVATION");
+                    }
 
-                    // Check if aurora is visible at user's location
-                    let user_lat = state.config.location.latitude;
-                    let user_lon = state.config.location.longitude;
+                    if !vl.is_empty() {
+                        // Check if aurora is visible at user's location
+                        let user_lat = state.config.location.latitude;
+                        let user_lon = state.config.location.longitude;
 
-                    if let Some(vl_lat) = viewline::is_aurora_visible(&vl, user_lat, user_lon) {
-                        info!(
-                            viewline_lat = vl_lat,
-                            user_lat = user_lat,
-                            "Aurora potentially visible!"
-                        );
+                        if let Some(vl_lat) =
+                            viewline::is_aurora_visible(&vl, user_lat, user_lon)
+                        {
+                            info!(
+                                viewline_lat = vl_lat,
+                                user_lat = user_lat,
+                                "Aurora potentially visible!"
+                            );
 
-                        // Get current Kp for the alert
-                        let kp = state
-                            .cache
-                            .kp_current
-                            .read()
-                            .unwrap()
-                            .last()
-                            .map(|k| k.kp_index)
-                            .unwrap_or(0.0);
+                            let kp = state
+                                .cache
+                                .kp_current
+                                .read()
+                                .unwrap()
+                                .last()
+                                .map(|k| k.kp_index)
+                                .unwrap_or(0.0);
 
-                        let mut alert = Alert {
-                            timestamp: Utc::now(),
-                            alert_type: AlertType::AuroraVisible,
-                            viewline_lat: vl_lat,
-                            user_lat,
-                            kp,
-                            notified_via: Vec::new(),
-                        };
+                            let mut alert = Alert {
+                                timestamp: Utc::now(),
+                                alert_type: AlertType::AuroraVisible,
+                                viewline_lat: vl_lat,
+                                user_lat,
+                                kp,
+                                notified_via: Vec::new(),
+                            };
 
-                        if let Some(_used) = state.notifications.notify(&mut alert) {
-                            if let Err(e) = state.db.insert_alert(&alert) {
-                                error!("Failed to persist alert: {}", e);
+                            if let Some(_used) = state.notifications.notify(&mut alert) {
+                                if let Err(e) = state.db.insert_alert(&alert) {
+                                    error!("Failed to persist alert: {}", e);
+                                }
                             }
+
+                            *state.cache.alert_active.write().unwrap() = true;
+                        } else {
+                            *state.cache.alert_active.write().unwrap() = false;
                         }
 
-                        *state.cache.alert_active.write().unwrap() = true;
-                    } else {
-                        *state.cache.alert_active.write().unwrap() = false;
+                        // Persist viewline snapshot
+                        let now = Utc::now();
+                        if let Err(e) = state.db.insert_viewline_snapshot(&now, &vl) {
+                            warn!("Failed to persist viewline snapshot: {}", e);
+                        }
+
+                        *state.cache.viewline.write().unwrap() = vl;
                     }
 
-                    // Persist viewline snapshot
-                    let now = Utc::now();
-                    if let Err(e) = state.db.insert_viewline_snapshot(&now, &vl) {
-                        warn!("Failed to persist viewline snapshot: {}", e);
-                    }
-
-                    // Update cache
-                    *state.cache.viewline.write().unwrap() = vl;
                     *state.cache.ovation.write().unwrap() = Some(ovation);
-                    *state.cache.last_ovation_poll.write().unwrap() = Some(now);
+                    *state.cache.last_ovation_poll.write().unwrap() = Some(Utc::now());
                 }
                 Err(e) => error!("Failed to fetch OVATION data: {}", e),
             }
@@ -110,8 +123,9 @@ fn spawn_kp_poll(state: Arc<AppState>, noaa: Arc<NoaaClient>) {
                         }
 
                         // Check Kp threshold
-                        if latest.kp_index >= state.config.thresholds.kp_min {
-                            info!(kp = latest.kp_index, "Kp threshold exceeded");
+                        let kp = latest.kp_index;
+                        if kp >= state.config.thresholds.kp_min {
+                            info!(kp = kp, "Kp threshold exceeded");
                         }
                     }
 
@@ -135,6 +149,8 @@ fn spawn_kp_forecast_poll(state: Arc<AppState>, noaa: Arc<NoaaClient>) {
 
             match noaa.fetch_kp_forecast().await {
                 Ok(forecast) => {
+                    let tonight = viewline::compute_tonight_viewline(&forecast, Utc::now());
+                    *state.cache.tonight_viewline.write().unwrap() = tonight;
                     *state.cache.kp_forecast.write().unwrap() = forecast;
                 }
                 Err(e) => error!("Failed to fetch Kp forecast: {}", e),

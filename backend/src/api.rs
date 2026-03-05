@@ -17,6 +17,7 @@ pub struct HistoryQuery {
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/aurora/viewline", get(get_viewline))
+        .route("/api/aurora/viewline/tonight", get(get_tonight_viewline))
         .route("/api/aurora/ovation", get(get_ovation))
         .route("/api/aurora/kp", get(get_kp))
         .route("/api/aurora/kp/forecast", get(get_kp_forecast))
@@ -33,6 +34,16 @@ async fn get_viewline(
 ) -> Json<serde_json::Value> {
     let viewline = state.cache.viewline.read().unwrap().clone();
     Json(serde_json::to_value(viewline).unwrap())
+}
+
+async fn get_tonight_viewline(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let tonight = state.cache.tonight_viewline.read().unwrap().clone();
+    match tonight {
+        Some(data) => Ok(Json(serde_json::to_value(data).unwrap())),
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 async fn get_ovation(

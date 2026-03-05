@@ -79,6 +79,16 @@ impl std::fmt::Display for AlertType {
     }
 }
 
+// --- Tonight's Viewline ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TonightViewlineResponse {
+    pub viewline: Vec<ViewlinePoint>,
+    pub max_kp: f64,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+}
+
 // --- API response wrappers ---
 
 #[derive(Debug, Clone, Serialize)]

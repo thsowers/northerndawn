@@ -8,10 +8,12 @@ import {
   type KpForecast,
   type SolarWind,
   type StatusResponse,
+  type TonightViewlineResponse,
 } from '@/api/client'
 
 export const useAuroraStore = defineStore('aurora', () => {
   const viewline = ref<ViewlinePoint[]>([])
+  const tonightViewline = ref<TonightViewlineResponse | null>(null)
   const ovation = ref<OvationData | null>(null)
   const kpCurrent = ref<KpIndex[]>([])
   const kpForecast = ref<KpForecast[]>([])
@@ -34,6 +36,10 @@ export const useAuroraStore = defineStore('aurora', () => {
     } catch (e) {
       console.error('Failed to fetch viewline:', e)
     }
+  }
+
+  async function fetchTonightViewline() {
+    tonightViewline.value = await api.getTonightViewline()
   }
 
   async function fetchOvation() {
@@ -82,6 +88,7 @@ export const useAuroraStore = defineStore('aurora', () => {
     try {
       await Promise.all([
         fetchViewline(),
+        fetchTonightViewline(),
         fetchOvation(),
         fetchKp(),
         fetchKpForecast(),
@@ -100,6 +107,7 @@ export const useAuroraStore = defineStore('aurora', () => {
 
     viewlineInterval = setInterval(() => {
       fetchViewline()
+      fetchTonightViewline()
       fetchOvation()
       fetchStatus()
     }, VIEWLINE_POLL_MS)
@@ -122,6 +130,7 @@ export const useAuroraStore = defineStore('aurora', () => {
 
   return {
     viewline,
+    tonightViewline,
     ovation,
     kpCurrent,
     kpForecast,

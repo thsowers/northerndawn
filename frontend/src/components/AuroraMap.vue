@@ -8,7 +8,8 @@ import 'leaflet.heat'
 const store = useAuroraStore()
 const mapContainer = ref<HTMLElement | null>(null)
 let map: L.Map | null = null
-let viewlineLayer: L.Polyline | null = null
+let ovationViewlineLayer: L.Polyline | null = null
+let tonightViewlineLayer: L.Polyline | null = null
 let heatLayer: L.Layer | null = null
 let userMarker: L.Marker | null = null
 
@@ -40,7 +41,7 @@ onMounted(() => {
 })
 
 watch(
-  () => [store.viewline, store.ovation, store.status],
+  () => [store.viewline, store.tonightViewline, store.ovation, store.status],
   () => updateMap(),
   { deep: true },
 )
@@ -48,19 +49,37 @@ watch(
 function updateMap() {
   if (!map) return
 
-  // Draw viewline (the "red line")
-  if (viewlineLayer) {
-    map.removeLayer(viewlineLayer)
+  // OVATION viewline — dashed, dimmed (background reference)
+  if (ovationViewlineLayer) {
+    map.removeLayer(ovationViewlineLayer)
   }
 
   if (store.viewline.length > 0) {
     const latLngs: L.LatLngExpression[] = store.viewline.map((p) => [p.lat, p.lon])
-    viewlineLayer = L.polyline(latLngs, {
+    ovationViewlineLayer = L.polyline(latLngs, {
+      color: '#aaaaaa',
+      weight: 2,
+      opacity: 0.4,
+      dashArray: '6, 8',
+      smoothFactor: 1,
+    }).addTo(map)
+  }
+
+  // Tonight's Kp forecast viewline — solid red, matching NOAA style
+  if (tonightViewlineLayer) {
+    map.removeLayer(tonightViewlineLayer)
+  }
+
+  if (store.tonightViewline && store.tonightViewline.viewline.length > 0) {
+    const latLngs: L.LatLngExpression[] = store.tonightViewline.viewline.map((p) => [p.lat, p.lon])
+    tonightViewlineLayer = L.polyline(latLngs, {
       color: '#ff3333',
       weight: 3,
       opacity: 0.8,
       smoothFactor: 1,
-    }).addTo(map)
+    })
+      .bindTooltip(`Tonight's viewline (Kp ${store.tonightViewline.max_kp})`, { sticky: true })
+      .addTo(map)
   }
 
   // OVATION heatmap
