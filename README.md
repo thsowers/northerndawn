@@ -1,4 +1,4 @@
-# Sunrise Winds
+# Northern Dawn
 
 A real-time aurora borealis monitoring dashboard. Tracks solar wind conditions, geomagnetic activity, and aurora viewline position using live data from NOAA's Space Weather Prediction Center (SWPC). Get notified when the northern lights might be visible from your location.
 
@@ -53,8 +53,8 @@ A real-time aurora borealis monitoring dashboard. Tracks solar wind conditions, 
 
 ```bash
 # Clone and configure
-git clone https://github.com/thsowers/sunrisewinds.git
-cd sunrisewinds/backend
+git clone https://github.com/thsowers/northerndawn.git
+cd northerndawn/backend
 cp config.example.toml config.toml
 # Edit config.toml with your latitude/longitude
 ```
@@ -78,8 +78,8 @@ This builds the frontend, compiles the backend in release mode, and serves every
 ### Docker
 
 ```bash
-docker build -t sunrisewinds .
-docker run -p 3000:3000 -v ./backend/config.toml:/app/config.toml sunrisewinds
+docker build -t northerndawn .
+docker run -p 3000:3000 -v ./backend/config.toml:/app/config.toml northerndawn
 ```
 
 ### Systemd
@@ -87,8 +87,8 @@ docker run -p 3000:3000 -v ./backend/config.toml:/app/config.toml sunrisewinds
 A service file is included for running as a system service:
 
 ```bash
-sudo cp sunrisewinds.service /etc/systemd/system/
-sudo systemctl enable --now sunrisewinds
+sudo cp northerndawn.service /etc/systemd/system/
+sudo systemctl enable --now northerndawn
 ```
 
 ### TUI

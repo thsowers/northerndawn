@@ -774,7 +774,7 @@ mod tests {
     /// (the same value NOAA uses for their viewline image), computes our
     /// viewline, and verifies it falls within expected NOAA reference ranges.
     ///
-    /// Run with: cargo test -p sunrisewinds test_live_noaa_comparison -- --ignored --nocapture
+    /// Run with: cargo test -p northerndawn test_live_noaa_comparison -- --ignored --nocapture
     #[tokio::test]
     async fn test_live_noaa_comparison() {
         use chrono::Utc;

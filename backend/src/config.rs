@@ -69,7 +69,7 @@ pub struct DatabaseConfig {
 pub fn load_config() -> anyhow::Result<AppConfig> {
     let settings = config::Config::builder()
         .add_source(config::File::with_name("config").required(false))
-        .add_source(config::Environment::with_prefix("SUNRISEWINDS").separator("__"))
+        .add_source(config::Environment::with_prefix("NORTHERNDAWN").separator("__"))
         .build()?;
 
     let config: AppConfig = settings.try_deserialize()?;

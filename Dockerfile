@@ -17,17 +17,17 @@ RUN cargo build --release
 # Stage 3: Runtime
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
-RUN useradd -r -s /bin/false sunrisewinds
+RUN useradd -r -s /bin/false northerndawn
 
 WORKDIR /app
-COPY --from=backend-builder /app/backend/target/release/sunrisewinds ./
+COPY --from=backend-builder /app/backend/target/release/northerndawn ./
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist/
 
-RUN mkdir -p /app/data && chown sunrisewinds:sunrisewinds /app/data
-USER sunrisewinds
+RUN mkdir -p /app/data && chown northerndawn:northerndawn /app/data
+USER northerndawn
 
-ENV RUST_LOG=sunrisewinds=info
+ENV RUST_LOG=northerndawn=info
 
 EXPOSE 3000
 
-CMD ["./sunrisewinds"]
+CMD ["./northerndawn"]
